@@ -1,0 +1,4 @@
+venv/
+watermarking/__pycache__/
+watermarking/checkpoints/
+watermarking/train_images/
