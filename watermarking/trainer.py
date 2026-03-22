@@ -200,7 +200,8 @@ class Trainer:
         total_loss_sum = 0.0
         psnr_sum = 0.0
         ber_sum = 0.0
-        component_sums: Dict[str, float] = {}
+        quality_component_sums: Dict[str, float] = {}
+        bce_component_sums: Dict[str, float] = {}
         num_batches = 0
 
         active_attacks = self.attack_sim.get_active_branch_names(epoch)
@@ -223,34 +224,47 @@ class Trainer:
             attacked_images = self.attack_sim(watermarked, current_epoch=epoch)
 
             # ── Forward: Decode each branch + aggregate loss ────────────────
-            total_branch_loss = torch.tensor(0.0, device=self.device)
-            branch_ber_sum = 0.0
+            # Compute image quality loss once (doesn't depend on attack branch)
+            if self.cfg.use_amp:
+                with torch.amp.autocast('cuda'):
+                    quality_loss, quality_components = self.criterion.compute_quality(
+                        images, watermarked, delta, epoch=epoch
+                    )
+            else:
+                quality_loss, quality_components = self.criterion.compute_quality(
+                    images, watermarked, delta, epoch=epoch
+                )
+
+            # Accumulate quality component stats
             num_branches = len(attacked_images)
+            for k, v in quality_components.items():
+                quality_component_sums[k] = quality_component_sums.get(k, 0.0) + v
+
+            total_bce = torch.tensor(0.0, device=self.device)
+            branch_ber_sum = 0.0
 
             for attacked_img in attacked_images:
                 if self.cfg.use_amp:
                     with torch.amp.autocast('cuda'):
                         logits = self.decoder(attacked_img)
-                        loss, components = self.criterion(
-                            images, watermarked, logits, watermarks, delta,
-                            epoch=epoch,
+                        bce_loss, bce_components = self.criterion.compute_bce(
+                            logits, watermarks, epoch=epoch
                         )
                 else:
                     logits = self.decoder(attacked_img)
-                    loss, components = self.criterion(
-                        images, watermarked, logits, watermarks, delta,
-                        epoch=epoch,
+                    bce_loss, bce_components = self.criterion.compute_bce(
+                        logits, watermarks, epoch=epoch
                     )
 
-                total_branch_loss = total_branch_loss + loss
+                total_bce = total_bce + bce_loss
                 branch_ber_sum += compute_ber(logits, watermarks)
 
-                # Accumulate component stats
-                for k, v in components.items():
-                    component_sums[k] = component_sums.get(k, 0.0) + v
+                # Accumulate BCE component stats
+                for k, v in bce_components.items():
+                    bce_component_sums[k] = bce_component_sums.get(k, 0.0) + v
 
             # Average loss across branches
-            avg_loss = total_branch_loss / num_branches
+            avg_loss = quality_loss + total_bce / num_branches
 
             # ── Backward + step ─────────────────────────────────────────────
             if self.scaler is not None:
@@ -287,14 +301,18 @@ class Trainer:
 
         # ── Epoch averages ──────────────────────────────────────────────────────
         n = max(num_batches, 1)
-        nb = n * num_branches  # total branch evaluations for component averaging
+        nb = n * num_branches  # total branch evaluations for BCE averaging
         metrics = {
             'loss': total_loss_sum / n,
             'psnr': psnr_sum / n,
             'ber': ber_sum / n,
             'bit_acc': (1.0 - ber_sum / n) * 100.0,
         }
-        for k, v in component_sums.items():
+        # Quality components: computed once per batch, average over batches
+        for k, v in quality_component_sums.items():
+            metrics[f'loss_{k}'] = v / n
+        # BCE component: summed over branches, average over batches*branches
+        for k, v in bce_component_sums.items():
             metrics[f'loss_{k}'] = v / nb
 
         return metrics

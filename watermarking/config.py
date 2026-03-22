@@ -75,8 +75,8 @@ class Config:
     curriculum_phase3_end: int = 40
 
     # ── Paths ───────────────────────────────────────────────────────────────────
-    train_data_dir: str = "train_images"
-    val_data_dir: str = "val_images"
+    train_data_dir: str = "/home/manvik/Desktop/watermarking/train_images/"
+    val_data_dir: str = "/home/manvik/Desktop/watermarking/test_images/"
     checkpoint_dir: str = "checkpoints"
     log_dir: str = "logs"
 

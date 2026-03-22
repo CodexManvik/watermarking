@@ -2,7 +2,7 @@
 DWT-based watermark decoder with channel-only attention (CBAM-inspired).
 
 Pipeline:
-    Input image → STN geometric correction → DWT → extract LL subband →
+    Input image → YCbCr conversion → STN geometric correction → DWT → extract LL subband →
     residual CNN with channel attention → global avg pool → FC → 256 logits
 
 NOTE: Only channel attention is used. Spatial attention is intentionally omitted
@@ -20,6 +20,7 @@ from .haar_dwt import HaarDWT
 from typing import Optional
 
 from .stn import SpatialTransformerNetwork
+from .encoder import rgb_to_ycbcr
 
 
 class ChannelAttention(nn.Module):
@@ -137,9 +138,9 @@ class WatermarkDecoder(nn.Module):
         # ── Classification head ─────────────────────────────────────────────────
         # GAP collapses spatial dims → FC maps to watermark logits
         self.head = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),    # (B, filters, 1, 1)
-            nn.Flatten(),               # (B, filters)
-            nn.Linear(filters, watermark_length),  # (B, 256) — logits, no sigmoid
+            nn.AdaptiveAvgPool2d((2,2)),    # (B, 64, 2, 2)
+            nn.Flatten(),               # (B, 256)
+            nn.Linear(filters * 4, watermark_length),  # Linear(256, 256)
         )
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
@@ -153,8 +154,11 @@ class WatermarkDecoder(nn.Module):
             (B, 256) watermark logits (pre-sigmoid). Apply sigmoid + threshold
             at 0.5 to recover binary bits at inference time.
         """
+        # Convert to YCbCr first — mirrors encoder domain so DWT sees Y-LL
+        ycbcr = rgb_to_ycbcr(image)  # (B, 3, 256, 256)
+
         # ── Step 1: Geometric correction via STN ────────────────────────────────
-        corrected = self.stn(image)  # (B, 3, 256, 256)
+        corrected = self.stn(ycbcr)  # (B, 3, 256, 256)
 
         # ── Step 2: DWT → LL subband ────────────────────────────────────────────
         yl, _ = self.dwt(corrected)  # yl: (B, 3, 128, 128)

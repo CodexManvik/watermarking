@@ -218,7 +218,7 @@ class AttackSimulator(nn.Module):
         x = self.diff_jpeg(image, quality=jpeg_q)
 
         # ── Gaussian blur ───────────────────────────────────────────────────────
-        sigma = random.uniform(0.3, 0.8) * strength
+        sigma = max(0.5, random.uniform(0.3, 0.8)) * strength
         # Create Gaussian kernel
         k_size = 5  # Fixed small kernel for efficiency
         ax = torch.arange(k_size, device=image.device, dtype=image.dtype) - k_size // 2

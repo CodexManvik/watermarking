@@ -55,7 +55,7 @@ class WatermarkLoss(nn.Module):
         bootstrap_epochs: int = 5,
         # Minimum embedding strength: add a penalty if the delta RMS falls below
         # this value, preventing the trivial solution where the encoder embeds nothing.
-        min_embed_rms: float = 0.005,
+        min_embed_rms: float = 0.05,
     ) -> None:
         super().__init__()
         self.lambda_mse = lambda_mse
@@ -87,58 +87,33 @@ class WatermarkLoss(nn.Module):
         """
         return watermark * self.label_smooth_pos + (1 - watermark) * self.label_smooth_neg
 
-    def forward(
+    def compute_quality(
         self,
         original_image: torch.Tensor,
         watermarked_image: torch.Tensor,
-        watermark_logits: torch.Tensor,
-        watermark_target: torch.Tensor,
         delta: torch.Tensor,
         epoch: int = 1,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        Compute total loss and individual component values.
-
-        Args:
-            original_image:    (B, 3, 256, 256) original RGB image.
-            watermarked_image: (B, 3, 256, 256) watermarked RGB image.
-            watermark_logits:  (B, 256) decoder output (pre-sigmoid).
-            watermark_target:  (B, 256) ground truth binary watermark.
-            delta:             (B, 3, 128, 128) embedding perturbation.
-            epoch:             Current training epoch (1-indexed).
-
-        Returns:
-            total_loss: Scalar tensor for backprop.
-            components: Dict of individual loss values (detached) for logging.
+        Compute total quality loss and individual component values.
         """
-        # Bootstrap detection: during first bootstrap_epochs, image quality losses
-        # (MSE, LPIPS, SSIM) are fully zeroed so BCE dominates and forces the
-        # encoder to embed a detectable signal. After bootstrap_epochs, quality
-        # losses are ramped back in linearly over the next 5 epochs.
         bootstrapping = epoch <= self.bootstrap_epochs
-        ramp_epochs = 5  # epochs to ramp quality losses back in
+        ramp_epochs = 5
         if bootstrapping:
             quality_weight = 0.0
-            # Increase BCE weight during bootstrap to force stronger embedding signal
-            bce_weight = self.lambda_bce * 2.0  # 3.0 → 6.0 during bootstrap
         elif epoch <= self.bootstrap_epochs + ramp_epochs:
-            # Linear ramp-in of image quality losses after bootstrap
             quality_weight = (epoch - self.bootstrap_epochs) / ramp_epochs
-            bce_weight = self.lambda_bce
         else:
             quality_weight = 1.0
-            bce_weight = self.lambda_bce
 
         # ── MSE loss ───────────────────────────────────────────────────────────
         mse_loss = F.mse_loss(watermarked_image, original_image) if quality_weight > 0 \
             else torch.tensor(0.0, device=original_image.device)
 
         # ── LPIPS loss ──────────────────────────────────────────────────────────
-        # Memory optimisation for RTX 3050: downsample to 128×128 before VGG16.
-        # Only computed when quality loss is active to save VRAM during bootstrap.
         def _lpips_safe(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             """Compute LPIPS in small sub-batches at half resolution."""
-            a_d = F.interpolate(a.detach(), size=(128, 128),
+            a_d = F.interpolate(a, size=(128, 128),
                                 mode='bilinear', align_corners=False)
             b_d = F.interpolate(b.detach(), size=(128, 128),
                                 mode='bilinear', align_corners=False)
@@ -164,20 +139,10 @@ class WatermarkLoss(nn.Module):
             ssim_val = torch.tensor(0.0, device=original_image.device)
             ssim_loss = torch.tensor(0.0, device=original_image.device)
 
-        # ── BCE loss (with label smoothing) ─────────────────────────────────────────
-        smooth_targets = self._smooth_targets(watermark_target)
-        bce_loss = F.binary_cross_entropy_with_logits(
-            watermark_logits, smooth_targets
-        )
-
         # ── Delta L2 regularization ──────────────────────────────────────────────────
         delta_loss = torch.mean(delta ** 2)
 
         # ── Minimum embedding strength ──────────────────────────────────────────────────
-        # Rejects the trivial solution (delta≈0): if the encoder's perturbation
-        # RMS falls below min_embed_rms, apply a strong penalty that grows as
-        # the delta shrinks. ReLU makes this penalty one-sided: no penalty when
-        # delta is already large enough.
         embed_rms = torch.sqrt(torch.mean(delta ** 2) + 1e-8)
         min_embed_loss = F.relu(self.min_embed_rms - embed_rms)
 
@@ -186,20 +151,43 @@ class WatermarkLoss(nn.Module):
             quality_weight * self.lambda_mse   * mse_loss
             + quality_weight * self.lambda_lpips * lpips_loss
             + quality_weight * self.lambda_ssim  * ssim_loss
-            + bce_weight                         * bce_loss
             + self.lambda_delta                  * delta_loss
             + 10.0                               * min_embed_loss
         )
 
-        # Component dict for logging (detached from the graph)
         components = {
             "mse":       mse_loss.item(),
             "lpips":     lpips_loss.item(),
             "ssim":      ssim_val.item() if quality_weight > 0 else 0.0,
-            "bce":       bce_loss.item(),
             "delta_l2":  delta_loss.item(),
             "embed_rms": embed_rms.item(),
-            "total":     total.item(),
+        }
+
+        return total, components
+
+    def compute_bce(
+        self,
+        watermark_logits: torch.Tensor,
+        watermark_target: torch.Tensor,
+        epoch: int = 1,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        bootstrapping = epoch <= self.bootstrap_epochs
+        ramp_epochs = 5
+        if bootstrapping:
+            bce_weight = self.lambda_bce * 2.0
+        elif epoch <= self.bootstrap_epochs + ramp_epochs:
+            bce_weight = self.lambda_bce
+        else:
+            bce_weight = self.lambda_bce
+
+        smooth_targets = self._smooth_targets(watermark_target)
+        bce_loss = F.binary_cross_entropy_with_logits(
+            watermark_logits, smooth_targets
+        )
+
+        total = bce_weight * bce_loss
+        components = {
+            "bce": bce_loss.item(),
         }
 
         return total, components
